@@ -210,6 +210,18 @@ impl AccountView {
         unsafe { self.owner() == program }
     }
 
+    /// Checks if the account is owned by the System program.
+    #[inline(always)]
+    pub fn is_system_owned(&self) -> bool {
+        // SAFETY: The `raw` pointer is guaranteed to be valid.
+        unsafe { self.owner().as_array() }
+            .chunks_exact(size_of::<u64>())
+            .fold(0u64, |acc, chunk| {
+                acc | u64::from_le_bytes(chunk.try_into().unwrap())
+            })
+            == 0
+    }
+
     /// Changes the owner of the account.
     ///
     /// # Safety
