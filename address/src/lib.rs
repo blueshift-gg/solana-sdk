@@ -734,6 +734,30 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_create_program_address_unchecked() {
+        for _ in 0..1_000 {
+            let program_id = Address::new_unique();
+            let (address, bump_seed) =
+                Address::find_program_address(&[b"Lil'", b"Bits"], &program_id);
+            // SAFETY: bump_seed was derived from find_program_address.
+            let unchecked_address = unsafe {
+                Address::create_program_address_unchecked(
+                    &[b"Lil'", b"Bits", &[bump_seed]],
+                    &program_id,
+                )
+                .unwrap()
+            };
+            assert_eq!(address, unchecked_address);
+
+            // Also verify it matches the checked version.
+            let checked_address =
+                Address::create_program_address(&[b"Lil'", b"Bits", &[bump_seed]], &program_id)
+                    .unwrap();
+            assert_eq!(unchecked_address, checked_address);
+        }
+    }
+
     fn address_from_seed_by_marker(marker: &[u8]) -> Result<Address, AddressError> {
         let key = Address::new_unique();
         let owner = Address::default();
