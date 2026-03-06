@@ -1,7 +1,4 @@
-#[cfg(all(
-    not(any(target_os = "solana", target_arch = "bpf")),
-    feature = "curve25519"
-))]
+#[cfg(any(target_os = "solana", target_arch = "bpf", feature = "curve25519"))]
 use crate::bytes_are_curve_point;
 #[cfg(any(target_os = "solana", target_arch = "bpf", feature = "curve25519"))]
 use crate::error::AddressError;
@@ -9,14 +6,32 @@ use crate::Address;
 /// Syscall definitions used by `solana_address`.
 #[cfg(any(target_os = "solana", target_arch = "bpf"))]
 pub use solana_define_syscall::definitions::{
-    sol_create_program_address, sol_curve_validate_point, sol_log_pubkey,
-    sol_try_find_program_address,
+    sol_curve_validate_point, sol_log_pubkey, sol_sha256,
 };
 
-/// Copied from `solana_program::entrypoint::SUCCESS`
-/// to avoid a `solana_program` dependency
+/// Helper: hash `slices` with `sol_sha256` into a 32-byte output.
+///
+/// # Safety
+///
+/// `&[u8]` on SBF has layout `(*const u8, u64)`, identical to the runtime's
+/// `SolBytes { val: *const u8, val_len: u64 }`. The cast reinterprets the
+/// contiguous array of slice references as the `SolBytes` array that
+/// `sol_sha256` expects. `assume_init` is sound because `sol_sha256`
+/// writes all 32 bytes of the output buffer.
+///
+/// This ABI assumption is the same one used in `solana-sha256-hasher`
+/// (`sha256-hasher/src/lib.rs`, `hashv`). See that crate for precedent.
 #[cfg(any(target_os = "solana", target_arch = "bpf"))]
-const SUCCESS: u64 = 0;
+#[inline(always)]
+unsafe fn hash_seeds(slices: &[&[u8]]) -> [u8; 32] {
+    let mut hash = core::mem::MaybeUninit::<[u8; 32]>::uninit();
+    sol_sha256(
+        slices as *const _ as *const u8,
+        slices.len() as u64,
+        hash.as_mut_ptr() as *mut u8,
+    );
+    hash.assume_init()
+}
 
 impl Address {
     /// Log an `Address` value.
@@ -301,8 +316,6 @@ impl Address {
         seeds: &[&[u8]],
         program_id: &Address,
     ) -> Option<(Address, u8)> {
-        // Perform the calculation inline, calling this from within a program is
-        // not supported
         #[cfg(not(any(target_os = "solana", target_arch = "bpf")))]
         {
             let mut bump_seed = [u8::MAX];
@@ -320,25 +333,44 @@ impl Address {
             }
             None
         }
-        // Call via a system call to perform the calculation
+
         #[cfg(any(target_os = "solana", target_arch = "bpf"))]
         {
-            let mut bytes = core::mem::MaybeUninit::<Address>::uninit();
-            let mut bump_seed = u8::MAX;
-            let result = unsafe {
-                crate::syscalls::sol_try_find_program_address(
-                    seeds as *const _ as *const u8,
-                    seeds.len() as u64,
-                    program_id as *const _ as *const u8,
-                    &mut bytes as *mut _ as *mut u8,
-                    &mut bump_seed as *mut _ as *mut u8,
-                )
-            };
-            match result {
-                // SAFETY: The syscall has initialized the bytes.
-                SUCCESS => Some((unsafe { bytes.assume_init() }, bump_seed)),
-                _ => None,
+            use crate::{MAX_SEEDS, MAX_SEED_LEN, PDA_MARKER};
+
+            if seeds.len() >= MAX_SEEDS {
+                return None;
             }
+            if seeds.iter().any(|seed| seed.len() > MAX_SEED_LEN) {
+                return None;
+            }
+
+            let n = seeds.len();
+            let mut bump = u8::MAX;
+            loop {
+                let bump_arr = [bump];
+                let mut slices = [&[] as &[u8]; MAX_SEEDS + 3];
+                let mut i = 0;
+                while i < n {
+                    slices[i] = seeds[i];
+                    i += 1;
+                }
+                slices[n] = &bump_arr;
+                slices[n + 1] = program_id.as_ref();
+                slices[n + 2] = PDA_MARKER.as_slice();
+                let input = &slices[..n + 3];
+
+                // SAFETY: see `hash_seeds`.
+                let hash_bytes = unsafe { hash_seeds(input) };
+                if !bytes_are_curve_point(&hash_bytes) {
+                    return Some((Address::new_from_array(hash_bytes), bump));
+                }
+                if bump == 0 {
+                    break;
+                }
+                bump -= 1;
+            }
+            None
         }
     }
 
@@ -402,8 +434,6 @@ impl Address {
             return Err(AddressError::MaxSeedLengthExceeded);
         }
 
-        // Perform the calculation inline, calling this from within a program is
-        // not supported
         #[cfg(not(any(target_os = "solana", target_arch = "bpf")))]
         {
             use crate::PDA_MARKER;
@@ -421,23 +451,115 @@ impl Address {
 
             Ok(Address::from(hash.to_bytes()))
         }
-        // Call via a system call to perform the calculation
+
         #[cfg(any(target_os = "solana", target_arch = "bpf"))]
         {
-            let mut bytes = core::mem::MaybeUninit::<Address>::uninit();
-            let result = unsafe {
-                crate::syscalls::sol_create_program_address(
-                    seeds as *const _ as *const u8,
-                    seeds.len() as u64,
-                    program_id as *const _ as *const u8,
-                    &mut bytes as *mut _ as *mut u8,
-                )
-            };
-            match result {
-                // SAFETY: The syscall has initialized the bytes.
-                SUCCESS => Ok(unsafe { bytes.assume_init() }),
-                _ => Err(result.into()),
+            use crate::PDA_MARKER;
+
+            let n = seeds.len();
+            let mut slices = [&[] as &[u8]; MAX_SEEDS + 2];
+            let mut i = 0;
+            while i < n {
+                slices[i] = seeds[i];
+                i += 1;
             }
+            slices[n] = program_id.as_ref();
+            slices[n + 1] = PDA_MARKER.as_slice();
+            let input = &slices[..n + 2];
+
+            // SAFETY: see `hash_seeds`.
+            let hash_bytes = unsafe { hash_seeds(input) };
+            if bytes_are_curve_point(&hash_bytes) {
+                return Err(AddressError::InvalidSeeds);
+            }
+            Ok(Address::new_from_array(hash_bytes))
+        }
+    }
+
+    /// Hash seeds into a program derived address **without** verifying that the
+    /// result is off the Ed25519 curve.
+    ///
+    /// This is semantically equivalent to [`create_program_address`] but skips
+    /// the Ed25519 curve check — use it when the bump seed is already known to
+    /// produce an off-curve result.
+    ///
+    /// [`create_program_address`]: Address::create_program_address
+    ///
+    /// # Safety
+    ///
+    /// This `unsafe` enforces a **security invariant**, not a memory-safety one:
+    /// the caller **must** guarantee that the resulting address does not lie on
+    /// the Ed25519 curve. This is satisfied when:
+    ///
+    /// - The seeds include a bump byte previously obtained from
+    ///   [`find_program_address`] or [`try_find_program_address`], **and**
+    /// - The seeds and program ID have not changed since the bump was derived.
+    ///
+    /// Violating this contract does not cause undefined behavior, but it allows
+    /// an attacker with the corresponding private key to sign for the account,
+    /// bypassing program authority.
+    ///
+    /// [`find_program_address`]: Address::find_program_address
+    /// [`try_find_program_address`]: Address::try_find_program_address
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use solana_address::Address;
+    /// # let program_id = Address::new_unique();
+    /// let (expected_pda, bump_seed) = Address::find_program_address(&[b"vault"], &program_id);
+    /// // SAFETY: bump_seed was just derived from find_program_address.
+    /// let actual_pda = unsafe {
+    ///     Address::create_program_address_unchecked(&[b"vault", &[bump_seed]], &program_id)
+    /// }?;
+    /// assert_eq!(expected_pda, actual_pda);
+    /// # Ok::<(), solana_address::error::AddressError>(())
+    /// ```
+    #[cfg(any(target_os = "solana", target_arch = "bpf", feature = "curve25519"))]
+    #[inline(always)]
+    pub unsafe fn create_program_address_unchecked(
+        seeds: &[&[u8]],
+        program_id: &Address,
+    ) -> Result<Address, AddressError> {
+        use crate::{MAX_SEEDS, MAX_SEED_LEN};
+
+        if seeds.len() > MAX_SEEDS {
+            return Err(AddressError::MaxSeedLengthExceeded);
+        }
+        if seeds.iter().any(|seed| seed.len() > MAX_SEED_LEN) {
+            return Err(AddressError::MaxSeedLengthExceeded);
+        }
+
+        #[cfg(not(any(target_os = "solana", target_arch = "bpf")))]
+        {
+            use crate::PDA_MARKER;
+
+            let mut hasher = solana_sha256_hasher::Hasher::default();
+            for seed in seeds.iter() {
+                hasher.hash(seed);
+            }
+            hasher.hashv(&[program_id.as_ref(), PDA_MARKER]);
+            let hash = hasher.result();
+            Ok(Address::from(hash.to_bytes()))
+        }
+
+        #[cfg(any(target_os = "solana", target_arch = "bpf"))]
+        {
+            use crate::PDA_MARKER;
+
+            let n = seeds.len();
+            let mut slices = [&[] as &[u8]; MAX_SEEDS + 2];
+            let mut i = 0;
+            while i < n {
+                slices[i] = seeds[i];
+                i += 1;
+            }
+            slices[n] = program_id.as_ref();
+            slices[n + 1] = PDA_MARKER.as_slice();
+            let input = &slices[..n + 2];
+
+            // SAFETY: see `hash_seeds`.
+            Ok(Address::new_from_array(hash_seeds(input)))
         }
     }
 }
